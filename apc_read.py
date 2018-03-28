@@ -3,6 +3,7 @@ import pickle
 import yaml
 
 import click
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.optimize
@@ -202,6 +203,25 @@ def _match_discard_outliers(view1, view2):
     return matches, inliers
 
 
+def _rotation_mtx_from_quaternions(q):
+    """Compute rotation matrix R from quaternions q."""
+    x = q[0]
+    y = q[1]
+    z = q[2]
+    w = q[3]
+
+    r0 = [1 - 2*(y**2 + z**2), 2*(x*y - z*w), 2*(x*z + y*w)]
+    r0 = np.array(r0)
+
+    r1 = [2*(x*y + z*w), 1 - 2*(x**2 + z**2), 2*(y*z - x*w)]
+    r1 = np.array(r1)
+
+    r2 = [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x**2 + y**2)]
+    r2 = np.array(r2)
+
+    return r0, r1, r2
+
+
 def _pose_estimation_loss(camera_mtx,
                           screen_coords,
                           world_coords,
@@ -223,13 +243,12 @@ def _pose_estimation_loss(camera_mtx,
     focal_length = 525
 
     # NOTE(brendan): The values to estimate.
-    r0 = camera_mtx[:1*3]
-    r1 = camera_mtx[1*3:2*3]
-    r2 = camera_mtx[2*3:3*3]
+    q = camera_mtx[:4]
+    r0, r1, r2 = _rotation_mtx_from_quaternions(q)
 
-    t_x = camera_mtx[3*3 + 0]
-    t_y = camera_mtx[3*3 + 1]
-    t_z = camera_mtx[3*3 + 2]
+    t_x = camera_mtx[4 + 0]
+    t_y = camera_mtx[4 + 1]
+    t_z = camera_mtx[4 + 2]
 
     world_coords = np.stack(world_coords)
     x_c = world_coords[:, 0]
@@ -243,18 +262,20 @@ def _pose_estimation_loss(camera_mtx,
     denominator = (r2[0]*x_c + r2[1]*y_c + r2[2]*z_c + t_z)
 
     # denominator*(x_s, y_s)
-    target = screen_coords
+    target = denominator[:, np.newaxis] * screen_coords
 
     # r_{00}*x_c + r_{01}*y_c + r_{02}*z_c + t_x
     prediction_x = focal_length*(r0[0]*x_c + r0[1]*y_c + r0[2]*z_c + t_x)
-    prediction_x /= denominator
     prediction_y = focal_length*(r1[0]*x_c + r1[1]*y_c + r1[2]*z_c + t_y)
-    prediction_y /= denominator
     prediction = np.concatenate(
         [prediction_x[:, np.newaxis], prediction_y[:, np.newaxis]], axis=1)
 
     error = target - prediction
-    return np.matmul(error, error.transpose()).mean()
+    mse = np.matmul(error, error.transpose()).mean()
+
+    mse += np.abs(np.sum(q**2) - 1)
+
+    return mse
 
 
 def _predict_pose(objname, descriptor_extractor, view1, view2):
@@ -268,11 +289,7 @@ def _predict_pose(objname, descriptor_extractor, view1, view2):
     screen_coords1to2 = saved_matches['screen_coords']
     view1 = saved_matches['view1']
     view2 = saved_matches['view2']
-    world_coords = saved_matches['world_coords']
-
-    match1to2_to_world_coord = {}
-    for i, m in enumerate(matches1to2[inliers1to2, 0]):
-        match1to2_to_world_coord.update({m: world_coords[i]})
+    world_coords1to2 = saved_matches['world_coords']
 
     view3 = _get_view(objname, descriptor_extractor, cam=3)
 
@@ -290,20 +307,54 @@ def _predict_pose(objname, descriptor_extractor, view1, view2):
 
     view3.inlier_points = view3.keypoints[matches3to1[:, 0]]
     view1.inlier_points = view1.keypoints[matches3to1[:, 1]]
-    world_coords = [match1to2_to_world_coord[m] for m in matches3to1[:, 1]]
+    # NOTE(brendan): We have saved a set of world coordinates in
+    # `world_coords`, where the list corresponds to the same sequence of screen
+    # coordinates in `screen_coords1to2`, for view 1 and view 2.
+    #
+    # Here, we want to take all of those screen coordinates for view 1 that
+    # have a feature that matches up with a feature in view 3, and save all
+    # the world coordinates corresponding to those features.
+    #
+    # Hence, `screen_coords1to2[i, 0, :]` where i corresponds to
+    # world_coords1to2[i] should be the same as `screen_coords3to1[j, 1, :]` where
+    # j corresponds to world_coords3to1[j]
+    match1to2_to_world_coord = {}
+    for i, m in enumerate(matches1to2[inliers1to2, 0]):
+        match1to2_to_world_coord.update({m: world_coords1to2[i]})
 
     screen_coords3to1 = _get_screen_coords(view3, view1)
 
-    # NOTE(brendan): Nine rotation parameters, three translation parameters.
-    # TODO(brendan): Use quaternions to restrict the number of parameters to
-    # estimate...
-    initial_guesses = np.random.randn(12)
+    world_coords3to1 = []
+    for m in matches3to1[:, 1]:
+        world_coords3to1.append(match1to2_to_world_coord[m])
 
-    args = (screen_coords3to1[:, 0, :], world_coords, view3, depth_coef)
-    optimize_result = _solve(initial_guesses,
-                             _pose_estimation_loss,
-                             bounds=(-np.inf, np.inf),
-                             args=args)
+    # NOTE(brendan): Four quaternion parameters representing the rotation,
+    # three translation parameters.
+    initial_guesses = np.zeros(7) + 0.5
+
+    object_points = np.zeros([len(world_coords3to1), 3])
+    for i, world_coord in enumerate(world_coords3to1):
+        object_points[i, 0] = world_coord[0]
+        object_points[i, 1] = world_coord[1]
+        pixel = screen_coords3to1[:, 0, :].astype(np.int32)
+        object_points[i, 2] = depth_coef*view3.depth[pixel[i, 1] + 240,
+                                                     pixel[i, 0] + 320]
+    _, rot, translation, _ = cv2.solvePnPRansac(
+        objectPoints=object_points,
+        imagePoints=screen_coords3to1[:, 0, :],
+        cameraMatrix=np.array([[525, 0, 0], [0, 525, 0], [0, 0, 1]], dtype=np.float64),
+        distCoeffs=None)
+    print(cv2.Rodrigues(rot))
+    print(translation)
+
+    # TODO(brendan): Gosh, why doesn't this work?
+    # args = (screen_coords3to1[:, 0, :], world_coords3to1, view3, depth_coef)
+    # optimize_result = _solve(initial_guesses,
+    #                          _pose_estimation_loss,
+    #                          bounds=(-np.inf, np.inf),
+    #                          args=args)
+    # print(_rotation_mtx_from_quaternions(initial_guesses[:4]))
+
     print(view3.pose['object_rotation_wrt_camera']['data'])
     print(view3.pose['object_translation_wrt_camera'])
 
