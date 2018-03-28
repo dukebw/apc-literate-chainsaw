@@ -371,6 +371,8 @@ def _vet_inliers(inliers, view1, view2, matches, ax):
         }
         pickle.dump(saved_matches, f)
 
+    return screen_coords, inliers, matches
+
 
 def _solve(initial_guesses, loss_fn, bounds, args):
     """Run the solver to find the result to minimize `loss_fn`."""
@@ -437,7 +439,11 @@ def apc_read(load_file, objname, should_predict_pose):
     plt.gray()
 
     if load_file is None:
-        _vet_inliers(inliers, view1, view2, matches, ax)
+        screen_coords, inliers, matches = _vet_inliers(inliers,
+                                                       view1,
+                                                       view2,
+                                                       matches,
+                                                       ax)
     else:
         with open(load_file, 'rb') as f:
             saved_matches = pickle.load(f)
