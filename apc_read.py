@@ -1,4 +1,6 @@
 """Amazon Picking Challenge dataset reader."""
+import json
+import os
 import pickle
 import yaml
 
@@ -47,6 +49,10 @@ class Struct:
         # Check for any remaining unknown arguments
         if kwargs:
             raise TypeError('Invalid argument(s): {}'.format(','.join(kwargs)))
+
+
+class Error(Struct):
+    _fields = ['rotation', 'translation']
 
 
 class ObjView(Struct):
@@ -118,7 +124,8 @@ def _triangulation_loss_depth(world_coords, screen_coords, views, depth_coef):
             [prediction_x[:, np.newaxis], prediction_y[:, np.newaxis]], axis=1)
 
         error = target - prediction
-        mse += np.matmul(error, error.transpose()).mean()
+        error = error.reshape(-1)
+        mse += np.dot(error, error)
 
     mse /= len(views)
 
@@ -158,19 +165,20 @@ def _triangulation_loss(params, screen_coords, views):
                                      depth_coef)
 
 
-def _get_view(objname, descriptor_extractor, cam):
+def _get_view(objname, descriptor_extractor, cam, shelf):
     """Construct a view for `objname` and camera view `cam`."""
-    view = ObjView(depth=None,
-                   descriptors=None,
-                   img=skimage.io.imread(f'{objname}-image-F-1-{cam}-0.png'),
-                   inlier_points=None,
-                   keypoints=None,
-                   pose=_get_pose(f'{objname}-pose-F-1-{cam}-0.yml'))
+    view = ObjView(
+        depth=None,
+        descriptors=None,
+        img=skimage.io.imread(f'{objname}-image-{shelf}-1-{cam}-0.png'),
+        inlier_points=None,
+        keypoints=None,
+        pose=_get_pose(f'{objname}-pose-{shelf}-1-{cam}-0.yml'))
 
     view.depth = []
     for i in range(4):
         view.depth.append(
-            skimage.io.imread(f'{objname}-depth-F-1-{cam}-{i}.png'))
+            skimage.io.imread(f'{objname}-depth-{shelf}-1-{cam}-{i}.png'))
 
     # NOTE(brendan): We stack the depth maps and take the median here, to throw
     # away outliers and get a reasonable reading from the depth sensor.
@@ -222,7 +230,7 @@ def _rotation_mtx_from_quaternions(q):
     return r0, r1, r2
 
 
-def _pose_estimation_loss(camera_mtx,
+def _pose_estimation_loss(params,
                           screen_coords,
                           world_coords,
                           view,
@@ -230,7 +238,7 @@ def _pose_estimation_loss(camera_mtx,
     """Compute pose estimation loss for optimizer inner loop.
 
     Args:
-        camera_mtx: Twelve camera parameters.
+        params: Seven camera parameters.
         screen_coords: (N, 2) coordinates of keypoints on image sensor.
         world_coords: (N, 2) 3D X, Y coordinates.
         view: The view to estimate pose for.
@@ -243,12 +251,12 @@ def _pose_estimation_loss(camera_mtx,
     focal_length = 525
 
     # NOTE(brendan): The values to estimate.
-    q = camera_mtx[:4]
+    q = params[:4]
     r0, r1, r2 = _rotation_mtx_from_quaternions(q)
 
-    t_x = camera_mtx[4 + 0]
-    t_y = camera_mtx[4 + 1]
-    t_z = camera_mtx[4 + 2]
+    t_x = params[4 + 0]
+    t_y = params[4 + 1]
+    t_z = params[4 + 2]
 
     world_coords = np.stack(world_coords)
     x_c = world_coords[:, 0]
@@ -271,92 +279,144 @@ def _pose_estimation_loss(camera_mtx,
         [prediction_x[:, np.newaxis], prediction_y[:, np.newaxis]], axis=1)
 
     error = target - prediction
-    mse = np.matmul(error, error.transpose()).mean()
+    error = error.reshape(-1)
+    mse = np.dot(error, error)
 
     mse += np.abs(np.sum(q**2) - 1)
 
     return mse
 
 
-def _predict_pose(objname, descriptor_extractor, view1, view2):
-    """Predicts the pose of a third image, from the first two."""
-    with open('test.pkl', 'rb') as f:
-        saved_matches = pickle.load(f)
-
-    depth_coef = saved_matches['depth_coef']
-    inliers1to2 = saved_matches['inliers']
-    matches1to2 = saved_matches['matches']
-    screen_coords1to2 = saved_matches['screen_coords']
-    view1 = saved_matches['view1']
-    view2 = saved_matches['view2']
-    world_coords1to2 = saved_matches['world_coords']
-
-    view3 = _get_view(objname, descriptor_extractor, cam=3)
-
-    matches3to1, inliers3to1 = _match_discard_outliers(view3, view1)
-    matches3to2, inliers3to2 = _match_discard_outliers(view3, view2)
-
-    matches3to1 = [m for m in matches3to1[inliers3to1]
-                   if ((m[0] in matches3to2[inliers3to2, 0]) and
-                       (m[1] in matches1to2[inliers1to2, 0]))]
-    print(f'common matches: {len(matches3to1)}')
-    matches3to1 = np.array(matches3to1)
-
-    print(f'view1 inliers: {len(view1.inlier_points)}')
-    print(f'view2 inliers: {len(view2.inlier_points)}')
-
-    view3.inlier_points = view3.keypoints[matches3to1[:, 0]]
-    view1.inlier_points = view1.keypoints[matches3to1[:, 1]]
-    # NOTE(brendan): We have saved a set of world coordinates in
-    # `world_coords`, where the list corresponds to the same sequence of screen
-    # coordinates in `screen_coords1to2`, for view 1 and view 2.
-    #
-    # Here, we want to take all of those screen coordinates for view 1 that
-    # have a feature that matches up with a feature in view 3, and save all
-    # the world coordinates corresponding to those features.
-    #
-    # Hence, `screen_coords1to2[i, 0, :]` where i corresponds to
-    # world_coords1to2[i] should be the same as `screen_coords3to1[j, 1, :]` where
-    # j corresponds to world_coords3to1[j]
-    match1to2_to_world_coord = {}
-    for i, m in enumerate(matches1to2[inliers1to2, 0]):
-        match1to2_to_world_coord.update({m: world_coords1to2[i]})
-
-    screen_coords3to1 = _get_screen_coords(view3, view1)
-
-    world_coords3to1 = []
-    for m in matches3to1[:, 1]:
-        world_coords3to1.append(match1to2_to_world_coord[m])
-
-    # NOTE(brendan): Four quaternion parameters representing the rotation,
-    # three translation parameters.
-    initial_guesses = np.zeros(7) + 0.5
-
-    object_points = np.zeros([len(world_coords3to1), 3])
-    for i, world_coord in enumerate(world_coords3to1):
+def _compute_pose_error(test_view,
+                        world_coords_test,
+                        screen_coords_test,
+                        depth_coef):
+    """Use `cv2.solvePnPRansac` (or my own function if it ever works...) to estimate pose."""
+    object_points = np.zeros([len(world_coords_test), 3])
+    for i, world_coord in enumerate(world_coords_test):
         object_points[i, 0] = world_coord[0]
         object_points[i, 1] = world_coord[1]
-        pixel = screen_coords3to1[:, 0, :].astype(np.int32)
-        object_points[i, 2] = depth_coef*view3.depth[pixel[i, 1] + 240,
-                                                     pixel[i, 0] + 320]
-    _, rot, translation, _ = cv2.solvePnPRansac(
+        pixel = screen_coords_test.astype(np.int32)
+        object_points[i, 2] = depth_coef*test_view.depth[pixel[i, 1] + 240,
+                                                         pixel[i, 0] + 320]
+    camera_mtx = np.array([[525, 0, 0], [0, 525, 0], [0, 0, 1]],
+                          dtype=np.float64)
+    _, pred_rot, pred_trans, inliers_pnp = cv2.solvePnPRansac(
         objectPoints=object_points,
-        imagePoints=screen_coords3to1[:, 0, :],
-        cameraMatrix=np.array([[525, 0, 0], [0, 525, 0], [0, 0, 1]], dtype=np.float64),
+        imagePoints=screen_coords_test,
+        cameraMatrix=camera_mtx,
         distCoeffs=None)
-    print(cv2.Rodrigues(rot))
-    print(translation)
+    if inliers_pnp is None:
+        print()
+        return None
+    pred_trans = pred_trans.squeeze()
+    pred_rot = pred_rot.squeeze()
+
+    translation_error = (pred_trans -
+                         test_view.pose['object_translation_wrt_camera'])
+    translation_error = np.linalg.norm(translation_error)
+    print(f'translation error: {translation_error} meters')
+
+    test_rotation = test_view.pose['object_rotation_wrt_camera']['data']
+    test_rotation = np.array(test_rotation).reshape(3, 3)
+    test_rotation = cv2.Rodrigues(test_rotation)[0].squeeze()
+    rotation_error = np.linalg.norm(pred_rot - test_rotation)
+    print(f'rotation error: {rotation_error} radians')
+
 
     # TODO(brendan): Gosh, why doesn't this work?
-    # args = (screen_coords3to1[:, 0, :], world_coords3to1, view3, depth_coef)
+    # Switch to axis/angle rotation representation?
+    # NOTE(brendan): Four quaternion parameters representing the rotation,
+    # three translation parameters.
+    # initial_guesses = np.zeros(7) + 0.5
+    # args = (screen_coords_test[:, 0, :],
+    #         world_coords_test,
+    #         test_view,
+    #         depth_coef)
     # optimize_result = _solve(initial_guesses,
     #                          _pose_estimation_loss,
     #                          bounds=(-np.inf, np.inf),
     #                          args=args)
     # print(_rotation_mtx_from_quaternions(initial_guesses[:4]))
 
-    print(view3.pose['object_rotation_wrt_camera']['data'])
-    print(view3.pose['object_translation_wrt_camera'])
+    print()
+
+    return rotation_error, translation_error
+
+
+def _predict_pose(objname, descriptor_extractor, test_view):
+    """Predicts the pose of a third image, from the first two."""
+    max_matches = 0
+    min_error = Error(rotation=np.inf, translation=np.inf)
+    for shelf in ['B', 'C', 'E', 'F', 'H', 'I', 'K', 'L']:
+        train_view = _get_view(objname, descriptor_extractor, cam=1, shelf=shelf)
+
+        directory = f'features/{objname}/{shelf}'
+        with open(f'{directory}/f.pkl', 'rb') as f:
+            saved_matches = pickle.load(f)
+
+        depth_coef = saved_matches['depth_coef']
+        inliers_train = saved_matches['inliers']
+        matches_train = saved_matches['matches']
+        train_view = saved_matches['view1']
+        world_coords_train = saved_matches['world_coords']
+
+        matches_test, inliers_test = _match_discard_outliers(test_view,
+                                                             train_view)
+
+        matches_test = [m for m in matches_test[inliers_test]
+                        if m[1] in matches_train[inliers_train, 0]]
+        print(f'common matches: {len(matches_test)}')
+        # NOTE(brendan): Only bother to run the predictions if there are at
+        # least 8 points.
+        if len(matches_test) < 8:
+            print()
+            continue
+        matches_test = np.array(matches_test)
+
+        print(f'train_view inliers: {len(train_view.inlier_points)}')
+
+        test_view.inlier_points = test_view.keypoints[matches_test[:, 0]]
+        train_view.inlier_points = train_view.keypoints[matches_test[:, 1]]
+        # NOTE(brendan): We have saved a set of world coordinates in
+        # `world_coords`, where the list corresponds to the same sequence of
+        # screen coordinates in `screen_coords_train`, for train_view (view 1)
+        # and view 2.
+        #
+        # Here, we want to take all of those screen coordinates for view 1 that
+        # have a feature that matches up with a feature in test_view, and save
+        # all the world coordinates corresponding to those features.
+        #
+        # Hence, `screen_coords_train[i, 0, :]` where i corresponds to
+        # world_coords_train[i] should be the same as
+        # `screen_coords_test[j, 1, :]` where j corresponds to
+        # world_coords_test[j]
+        match_train_to_world_coord = {}
+        for i, m in enumerate(matches_train[inliers_train, 0]):
+            match_train_to_world_coord.update({m: world_coords_train[i]})
+
+        screen_coords_test = _get_screen_coords(test_view, train_view)
+
+        world_coords_test = []
+        for m in matches_test[:, 1]:
+            world_coords_test.append(match_train_to_world_coord[m])
+
+        errors = _compute_pose_error(test_view,
+                                     world_coords_test,
+                                     screen_coords_test[:, 0, :],
+                                     depth_coef)
+        if errors is None:
+            continue
+
+        rotation_error, translation_error = errors
+        # NOTE(brendan): Use the predictions from the bin with the most
+        # matches.
+        if len(matches_test) > max_matches:
+            max_matches = len(matches_test)
+            min_error.rotation = rotation_error
+            min_error.translation = translation_error
+
+    return min_error
 
 
 def _get_screen_coords(view1, view2):
@@ -412,16 +472,6 @@ def _vet_inliers(inliers, view1, view2, matches, ax):
 
     screen_coords = _get_screen_coords(view1, view2)
 
-    with open('test.pkl', 'wb') as f:
-        saved_matches = {
-            'inliers': inliers,
-            'matches': matches,
-            'screen_coords': screen_coords,
-            'view1': view1,
-            'view2': view2,
-        }
-        pickle.dump(saved_matches, f)
-
     return screen_coords, inliers, matches
 
 
@@ -457,102 +507,79 @@ def _solve(initial_guesses, loss_fn, bounds, args):
 
 
 @click.command()
-@click.option('--load-file',
-              default=None,
-              help='File to load previously matched keypoints from.')
 @click.option('--objname',
               default='',
               help='Filename of YAML file for example.')
 @click.option('--should-predict-pose/--no-should-predict-pose',
               default=False,
-              help='If set, pose will be predicted from the matched keypoints '
-                   'in load-file.')
-def apc_read(load_file, objname, should_predict_pose):
+              help='If set, pose will be predicted from the matched '
+                   'keypoints.')
+def apc_read(objname, should_predict_pose):
     """Process raw APC dataset."""
     np.random.seed(0)
 
     descriptor_extractor = skimage.feature.ORB()
 
-    view1 = _get_view(objname, descriptor_extractor, cam=1)
-    view2 = _get_view(objname, descriptor_extractor, cam=2)
-
     if should_predict_pose:
-        _predict_pose(objname, descriptor_extractor, view1, view2)
+        obj_basename = os.path.basename(objname)
+        result_log = {}
+        for shelf in ['A', 'D', 'G', 'J']:
+            print(f'Evaluating shelf {shelf}!')
+
+            view = _get_view(objname, descriptor_extractor, cam=1, shelf=shelf)
+            error = _predict_pose(objname, descriptor_extractor, view)
+            result_log[f'{obj_basename}/{shelf}/rotation_error'] = error.rotation
+            result_log[f'{obj_basename}/{shelf}/translation_error'] = error.translation
+
+        os.system('mkdir results')
+        with open(f'results/{obj_basename}', 'w') as f:
+            json.dump(result_log, f)
+
         exit()
 
-    matches, inliers = _match_discard_outliers(view1, view2)
+    # NOTE(brendan): Depth coefficient computed from shelf F examples.
+    depth_coef = 2.09e-5
+    for shelf in ['B', 'C', 'E', 'F', 'H', 'I', 'K', 'L']:
+        view1 = _get_view(objname, descriptor_extractor, cam=1, shelf=shelf)
+        view2 = _get_view(objname, descriptor_extractor, cam=2, shelf=shelf)
 
-    num_inliers = inliers.sum()
-    print(f'Number of matches: {matches.shape[0]}')
-    print(f'Number of inliers: {inliers.sum()}')
+        matches, inliers = _match_discard_outliers(view1, view2)
 
-    _, ax = plt.subplots(nrows=1, ncols=1)
-    plt.gray()
+        print(f'Number of matches: {matches.shape[0]}')
+        print(f'Number of inliers: {inliers.sum()}')
 
-    if load_file is None:
+        _, ax = plt.subplots(nrows=1, ncols=1)
+        plt.gray()
+
         screen_coords, inliers, matches = _vet_inliers(inliers,
                                                        view1,
                                                        view2,
                                                        matches,
                                                        ax)
-    else:
-        with open(load_file, 'rb') as f:
-            saved_matches = pickle.load(f)
 
-        inliers = saved_matches['inliers']
-        matches = saved_matches['matches']
-        screen_coords = saved_matches['screen_coords']
-        view1 = saved_matches['view1']
-        view2 = saved_matches['view2']
+        world_coords = []
+        for i in range(screen_coords.shape[0]):
+            initial_guess = np.zeros([2])
+            args = (screen_coords[i:i + 1], [view1, view2], depth_coef)
+            optimize_result = _solve(initial_guess,
+                                     _triangulation_loss_depth,
+                                     bounds=(-np.inf, np.inf),
+                                     args=args)
+            world_coords.append(optimize_result.x)
 
-    # NOTE(brendan): Initial guesses for (X, Y) world coordinates.
-    # `initial_guesses[0]` is the conversion parameter from the depth sensor's
-    # depth value to depth in meters.
-    num_points = 6
-    num_params = 1 + 2*num_points
-    initial_guesses = np.zeros([1 + 2*num_inliers])
-    initial_guesses[0] = 1.0
-    bounds = (np.repeat(-np.inf, num_params), np.inf)
-    bounds[0][0] = 0
-
-    # NOTE(brendan): Take the first 6 points, and estimate the depth
-    # coefficient, then fix it to estimate the X, Y coordinates.
-    optimize_result = _solve(initial_guesses[:num_params],
-                             _triangulation_loss,
-                             bounds,
-                             args=(screen_coords[:num_points], [view1, view2]))
-
-    depth_coef = optimize_result.x[0]
-    world_coords = []
-    for i in range(screen_coords.shape[0]):
-        initial_guess = np.zeros([2])
-        args = (screen_coords[i:i + 1], [view1, view2], depth_coef)
-        optimize_result = _solve(initial_guess,
-                                 _triangulation_loss_depth,
-                                 bounds=(-np.inf, np.inf),
-                                 args=args)
-        world_coords.append(optimize_result.x)
-
-    with open('test.pkl', 'wb') as f:
-        saved_matches = {
-            'depth_coef': depth_coef,
-            'inliers': inliers,
-            'matches': matches,
-            'screen_coords': screen_coords,
-            'view1': view1,
-            'view2': view2,
-            'world_coords': world_coords,
-        }
-        pickle.dump(saved_matches, f)
-
-    skimage.feature.plot_matches(ax=ax,
-                                 image1=view1.img,
-                                 image2=view2.img,
-                                 keypoints1=view1.keypoints,
-                                 keypoints2=view2.keypoints,
-                                 matches=matches[inliers],
-                                 only_matches=True)
-    plt.show()
+        directory = f'features/{objname}/{shelf}'
+        os.system(f'mkdir -p {directory}')
+        with open(f'{directory}/f.pkl', 'wb') as f:
+            saved_matches = {
+                'depth_coef': depth_coef,
+                'inliers': inliers,
+                'matches': matches,
+                'screen_coords': screen_coords,
+                'view1': view1,
+                'view2': view2,
+                'world_coords': world_coords,
+            }
+            pickle.dump(saved_matches, f)
 
 
 if __name__ == '__main__':
